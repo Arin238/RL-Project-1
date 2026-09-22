@@ -58,6 +58,10 @@ def run(args, visualize = True):
     num_runs = args.num_runs
     T = args.T
     output_dir = args.output_dir
+
+    if visualize:
+        os.makedirs(output_dir, exist_ok=True)
+
     #get the agent and the environemnt
     agent = Agent(layout_file, prob_file)
     

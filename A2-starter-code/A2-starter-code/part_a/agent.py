@@ -1,4 +1,3 @@
-import heapq
 import random
 import time
 
@@ -441,91 +440,34 @@ class Agent:
 
     def _evaluate_policy(self, deadline):
         """
-        Evaluate the current policy using prioritized sweeping.
+        Evaluate the current policy with in-place Bellman sweeps.
 
-        The heap is a max heap implemented by storing negative priorities
-        in Python's min heap.
+        A complete sweep is much cheaper than repeatedly propagating
+        duplicate predecessor updates through this highly connected model.
         """
 
-        priority_queue = []
-        pending_priority = [0.0] * self.num_states
-        tolerance = 1e-6
-        max_updates = 1000
+        tolerance = 1e-8
+        max_sweeps = 250
 
-        for state_index in range(self.num_states):
+        for sweep in range(max_sweeps):
             if time.monotonic() >= deadline:
                 return
 
-            backed_up_value = self._policy_backup(state_index)
+            maximum_change = 0.0
 
-            residual = abs(
-                backed_up_value - self.values[state_index]
-            )
-
-            if residual > tolerance:
-                pending_priority[state_index] = residual
-                heapq.heappush(
-                    priority_queue,
-                    (-residual, state_index)
+            for state_index in range(self.num_states):
+                backed_up_value = self._policy_backup(state_index)
+                change = abs(
+                    backed_up_value - self.values[state_index]
                 )
 
-        updates = 0
+                if change > maximum_change:
+                    maximum_change = change
 
-        while priority_queue and time.monotonic() < deadline:
-            negative_priority, state_index = heapq.heappop(
-                priority_queue
-            )
+                self.values[state_index] = backed_up_value
 
-            priority = -negative_priority
-
-            if priority + tolerance < pending_priority[state_index]:
-                continue
-
-            pending_priority[state_index] = 0.0
-
-            current_backup = self._policy_backup(state_index)
-
-            current_residual = abs(
-                current_backup - self.values[state_index]
-            )
-
-            # Ignore stale heap entries.
-            if current_residual + 1e-12 < priority:
-                continue
-
-            if current_residual <= tolerance:
-                continue
-
-            self.values[state_index] = current_backup
-            updates += 1
-
-            if updates >= max_updates:
+            if maximum_change <= tolerance:
                 return
-
-            for predecessor in self.predecessors[state_index]:
-                if time.monotonic() >= deadline:
-                    return
-
-                predecessor_backup = self._policy_backup(
-                    predecessor
-                )
-
-                predecessor_residual = abs(
-                    predecessor_backup - self.values[predecessor]
-                )
-
-                if (
-                    predecessor_residual > tolerance
-                    and predecessor_residual > pending_priority[predecessor]
-                ):
-                    pending_priority[predecessor] = predecessor_residual
-                    heapq.heappush(
-                        priority_queue,
-                        (-predecessor_residual, predecessor)
-                    )
-
-            if updates % 1000 == 0 and time.monotonic() >= deadline:
-                break
 
     def _improve_policy(self, deadline):
         """
