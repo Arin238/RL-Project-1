@@ -20,6 +20,12 @@ class Agent:
 
         self.n = self.env.N
         self.actions = range(4)
+        self.action_delta = (
+            (1, 0),
+            (-1, 0),
+            (0, -1),
+            (0, 1)
+        )
 
         self.treasure_locations = tuple(
             self.env.locations["treasure"]
@@ -56,7 +62,10 @@ class Agent:
         self.num_actions = 4
 
         self.transitions = [None] * self.num_states
-        self.predecessors = [[] for _ in range(self.num_states)]
+        self.predecessors = [set() for _ in range(self.num_states)]
+
+        self.ship_distributions = {}
+        self.pirate_distributions = [{}, {}]
 
         self._build_transition_model()
 
@@ -122,14 +131,7 @@ class Agent:
             3 -> RIGHT
         """
 
-        action_delta = [
-            (1, 0),
-            (-1, 0),
-            (0, -1),
-            (0, 1)
-        ]
-
-        row_delta, col_delta = action_delta[action]
+        row_delta, col_delta = self.action_delta[action]
 
         return (
             location[0] + row_delta,
@@ -159,6 +161,10 @@ class Agent:
         Invalid pirate moves result in the pirate staying still.
         """
 
+        cached = self.pirate_distributions[pirate_number].get(location)
+        if cached is not None:
+            return cached
+
         probabilities = self.pirate_prob[pirate_number]
 
         if pirate_number == 0:
@@ -180,7 +186,9 @@ class Agent:
                 distribution.get(candidate, 0.0) + probability
             )
 
-        return list(distribution.items())
+        result = tuple(distribution.items())
+        self.pirate_distributions[pirate_number][location] = result
+        return result
 
     def _ship_distribution(self, location, action):
         """
@@ -190,6 +198,18 @@ class Agent:
         With probability ship_prob[1], it chooses uniformly from
         the other three actions.
         """
+
+        cached = self.ship_distributions.get(location)
+        if cached is None:
+            cached = []
+            self.ship_distributions[location] = cached
+        else:
+            result = cached[action]
+            if result is not None:
+                return result
+
+        if not cached:
+            cached.extend([None] * self.num_actions)
 
         distribution = {}
 
@@ -211,7 +231,9 @@ class Agent:
                 distribution.get(candidate, 0.0) + probability
             )
 
-        return list(distribution.items())
+        result = tuple(distribution.items())
+        cached[action] = result
+        return result
 
     def _next_treasure_mask(self, ship_location, treasure_mask):
         """
@@ -253,6 +275,13 @@ class Agent:
             pirate_2_location,
             treasure_mask
         ) = state
+
+        if self._is_terminal(
+            ship_location,
+            pirate_1_location,
+            pirate_2_location
+        ):
+            return ()
 
         outcomes = {}
 
@@ -368,16 +397,10 @@ class Agent:
                     reward,
                     terminal
                 ) in outcomes:
-                    if probability > 0:
-                        self.predecessors[next_state_index].append(
+                    if probability > 0 and not terminal:
+                        self.predecessors[next_state_index].add(
                             state_index
                         )
-
-        # Remove duplicate predecessor entries.
-        for state_index in range(self.num_states):
-            self.predecessors[state_index] = list(
-                set(self.predecessors[state_index])
-            )
 
     def _action_value(self, state_index, action):
         """
@@ -425,15 +448,22 @@ class Agent:
         """
 
         priority_queue = []
+        pending_priority = [0.0] * self.num_states
+        tolerance = 1e-6
+        max_updates = 1000
 
         for state_index in range(self.num_states):
+            if time.monotonic() >= deadline:
+                return
+
             backed_up_value = self._policy_backup(state_index)
 
             residual = abs(
                 backed_up_value - self.values[state_index]
             )
 
-            if residual > 1e-10:
+            if residual > tolerance:
+                pending_priority[state_index] = residual
                 heapq.heappush(
                     priority_queue,
                     (-residual, state_index)
@@ -448,6 +478,11 @@ class Agent:
 
             priority = -negative_priority
 
+            if priority + tolerance < pending_priority[state_index]:
+                continue
+
+            pending_priority[state_index] = 0.0
+
             current_backup = self._policy_backup(state_index)
 
             current_residual = abs(
@@ -458,13 +493,19 @@ class Agent:
             if current_residual + 1e-12 < priority:
                 continue
 
-            if current_residual <= 1e-10:
+            if current_residual <= tolerance:
                 continue
 
             self.values[state_index] = current_backup
             updates += 1
 
+            if updates >= max_updates:
+                return
+
             for predecessor in self.predecessors[state_index]:
+                if time.monotonic() >= deadline:
+                    return
+
                 predecessor_backup = self._policy_backup(
                     predecessor
                 )
@@ -473,7 +514,11 @@ class Agent:
                     predecessor_backup - self.values[predecessor]
                 )
 
-                if predecessor_residual > 1e-10:
+                if (
+                    predecessor_residual > tolerance
+                    and predecessor_residual > pending_priority[predecessor]
+                ):
+                    pending_priority[predecessor] = predecessor_residual
                     heapq.heappush(
                         priority_queue,
                         (-predecessor_residual, predecessor)
@@ -482,7 +527,7 @@ class Agent:
             if updates % 1000 == 0 and time.monotonic() >= deadline:
                 break
 
-    def _improve_policy(self):
+    def _improve_policy(self, deadline):
         """
         Perform policy improvement.
 
@@ -492,6 +537,9 @@ class Agent:
         policy_stable = True
 
         for state_index in range(self.num_states):
+            if time.monotonic() >= deadline:
+                return False
+
             old_action = self.policy[state_index]
 
             best_action = old_action
@@ -501,6 +549,9 @@ class Agent:
             )
 
             for action in self.actions:
+                if time.monotonic() >= deadline:
+                    return False
+
                 candidate_value = self._action_value(
                     state_index,
                     action
@@ -561,17 +612,22 @@ class Agent:
         start_time = time.monotonic()
         deadline = start_time + time_limit
 
-        # Leave a very small amount of time for returning cleanly.
-        deadline -= 0.01
+        # Leave time for returning cleanly before run.py's alarm fires.
+        deadline -= 0.5
 
         self.policy_ready = False
 
-        while time.monotonic() < deadline:
+        max_policy_iterations = 25
+
+        for _ in range(max_policy_iterations):
+            if time.monotonic() >= deadline:
+                break
+
             old_policy = self.policy.copy()
 
             self._evaluate_policy(deadline)
 
-            policy_stable = self._improve_policy()
+            policy_stable = self._improve_policy(deadline)
 
             if policy_stable:
                 break
