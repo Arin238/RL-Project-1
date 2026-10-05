@@ -14,9 +14,11 @@ class Agent:
     when a state is mirrored.
     """
 
-    # Action semantics as fixed by the assignment (see starter get_action docstring).
-    ACTION_INCREASE_LANE = 2
-    ACTION_DECREASE_LANE = 3
+    # Lane-change probe: repeats of each action from a fresh env, and the
+    # step cap on one probe (actions succeed only with some probability).
+    PROBE_TRIALS = 6
+    PROBE_STEPS = 4
+
     # Episode length of the simulator; reaching it is a time limit, not a crash.
     EPISODE_STEPS = 1000
 
@@ -46,10 +48,10 @@ class Agent:
         self.q = [[0.0] * self.num_actions for _ in range(num_states)]
         self.visits = [[0] * self.num_actions for _ in range(num_states)]
 
-        # Swapping inc/dec lane maps an action onto its left/right mirror image.
+        # Which actions change lane is not assumed: learn_policy probes the
+        # environment for them. Until then, no mirroring is applied.
         self.mirror_action = list(range(self.num_actions))
-        self.mirror_action[self.ACTION_INCREASE_LANE] = self.ACTION_DECREASE_LANE
-        self.mirror_action[self.ACTION_DECREASE_LANE] = self.ACTION_INCREASE_LANE
+        self.use_mirror = False
 
         self.prev_dist = None
         self.episode_calls = 0
@@ -67,13 +69,63 @@ class Agent:
         left = min_dist[lane - 1] if lane > 0 else self.wall
         right = min_dist[lane + 1] if lane < self.num_lanes - 1 else self.wall
 
-        mirrored = left > right
+        mirrored = self.use_mirror and left > right
         if mirrored:
             left, right = right, left
 
         nd, ns = self.num_dist, self.side_states
         index = (((speed * nd + own) * nd + prev_own) * ns + left) * ns + right
         return index, mirrored
+
+    def _discover_lane_actions(self, deadline, rand):
+        """
+        Finds the (increase-lane, decrease-lane) actions by trying each action
+        from fresh environments and voting on the direction of the first lane
+        change it causes. Lane changes only come from the agent's own action,
+        and the car starts in a middle lane, so both directions are observable.
+        Falls back to random driving if the probe is inconclusive, and returns
+        None if the actions are still unknown when the deadline is reached.
+        """
+        num_actions = self.num_actions
+        votes = [0] * num_actions
+
+        def record(action, lane_before, lane_after):
+            if lane_after > lane_before:
+                votes[action] += 1
+            elif lane_after < lane_before:
+                votes[action] -= 1
+
+        def decide():
+            inc = max(range(num_actions), key=votes.__getitem__)
+            dec = min(range(num_actions), key=votes.__getitem__)
+            if votes[inc] > 0 and votes[dec] < 0:
+                return inc, dec
+            return None
+
+        for _ in range(self.PROBE_TRIALS):
+            for action in range(num_actions):
+                if time.monotonic() >= deadline:
+                    return decide()
+                env = HighwayEnv()
+                lane = env.get_state()[1]
+                for _ in range(self.PROBE_STEPS):
+                    obs, _, done = env.step(action)
+                    if obs[1] != lane:
+                        record(action, lane, obs[1])
+                        break
+                    if done:
+                        break
+
+        while decide() is None and time.monotonic() < deadline:
+            env = HighwayEnv()
+            lane = env.get_state()[1]
+            done = False
+            while not done:
+                action = int(rand() * num_actions)
+                obs, _, done = env.step(action)
+                record(action, lane, obs[1])
+                lane = obs[1]
+        return decide()
 
     def learn_policy(self, time_limit):
         clock = time.monotonic
@@ -86,6 +138,14 @@ class Agent:
         deadline = start_time + budget
 
         rand = random.Random().random
+
+        lane_actions = self._discover_lane_actions(deadline, rand)
+        if lane_actions is not None:
+            inc_action, dec_action = lane_actions
+            # Swapping inc/dec lane maps an action onto its left/right mirror image.
+            self.mirror_action[inc_action] = dec_action
+            self.mirror_action[dec_action] = inc_action
+            self.use_mirror = True
 
         # Local bindings for the hot loop
         q, visits, gamma = self.q, self.visits, self.gamma
