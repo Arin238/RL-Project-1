@@ -1,0 +1,134 @@
+Arin Chandurkar (2024CS50002), Yashdeep Singh (2024CS50248)
+
+COL333 Assignment 2 - Report
+
+============================================================
+PART A: TreasureHunt (finding the best policy when the model is known)
+============================================================
+
+Method: Value Iteration.
+
+1. How we set up the MDP
+   - A state is (ship position, pirate 1 position, pirate 2 position,
+     which treasures are still left).
+   - "Which treasures are left" is stored as a small bit mask. With two
+     treasures there are only 4 possible masks.
+   - The ship can only be on sea cells. Each pirate can only be inside
+     its own region. So we only number the states that can really happen.
+   - A state is terminal if the ship is on the fort or on the same cell
+     as a pirate.
+
+2. Building the transition model (done once, at the start)
+   - Ship: the chosen move happens with probability ps, and each of the
+     other three moves happens with probability (1 - ps) / 3. If a move
+     goes off the grid or onto land, the ship stays where it is.
+   - Pirates: each pirate moves on its own using its given probabilities.
+     If a move leaves its region, it stays where it is. The two pirates
+     are independent, so their joint probability is just the product.
+   - For every (state, action) we list all possible next positions and
+     their probabilities.
+   - Reward for each step: step reward, plus pirate reward if the ship
+     ends up on a pirate (episode ends), or plus fort reward if the ship
+     reaches the fort (episode ends), plus treasure reward if the ship
+     lands on a treasure that is still there.
+   - Main saving: the ship and pirate movement does not depend on the
+     treasures. So we build the movement table only once and reuse it
+     for all 4 treasure masks. When the ship lands on a treasure, we just
+     switch off that bit in the mask for the next state.
+
+3. Value Iteration
+   - We start with all values at 0 and an initial policy that simply picks
+     the action with the best immediate reward.
+   - Then we repeat the Bellman update:
+       V(s) = max over actions of
+              [ expected reward + gamma * sum of P(s'|s,a) * V(s') ]
+     and the policy is the action that gives this maximum.
+   - The update is done one treasure mask at a time and new values are
+     used right away (in-place update), which makes it converge faster.
+     Masks with fewer treasures are updated first, because states with
+     more treasures move into them.
+   - Everything is written with numpy arrays (no Python loops over
+     states during learning), so each sweep is fast even on a 30x30 grid.
+
+4. Time limit
+   - We keep sweeping until the time limit is almost over, leaving a small
+     safety margin.
+   - We keep a running average of how long one mask update takes. If the
+     remaining time is less than that, we stop, so we never go over time.
+   - After every mask update the stored policy is valid, so stopping at
+     any point still gives a usable policy.
+
+5. Choosing an action
+   - get_action turns the remaining treasures into a mask, finds the state
+     number, and returns the stored best action from the policy table.
+
+6. Safety checks
+   - We check that the discount factor is between 0 and 1 (not 1), that the
+     rewards are finite, and that probabilities add up correctly. If a
+     value becomes infinite or NaN during learning, we raise an error.
+
+============================================================
+PART B: Highway (Q-learning, model is NOT known)
+============================================================
+
+Method: Tabular Q-learning with epsilon-greedy exploration.
+
+1. State used by the agent
+   We do not use the raw state directly. We make a smaller state with:
+   - speed of our car,
+   - distance to the car ahead in our own lane,
+   - the same distance at the previous step (this tells the agent if the
+     car ahead is getting closer or not),
+   - distance in the lane to the left,
+   - distance in the lane to the right.
+   If there is no lane on one side (we are at the edge), we use a special
+   "wall" value for that side.
+   Total states = 4 * 5 * 5 * 6 * 6 = 3600, each with 5 actions.
+
+2. Left/right mirroring
+   Driving is basically the same if we flip left and right. So if the left
+   side looks better than the right side, we swap them and also swap the
+   "increase lane" and "decrease lane" actions. This way one Q-table entry
+   is used for both mirror cases, so the agent learns about twice as fast.
+   To know which action numbers change the lane up or down, at the start we
+   play a few random steps in a separate copy of the environment and watch
+   how the lane changes.
+
+3. Q-learning update
+   After each step:
+       target = r                         if the episode ended
+       target = r + gamma * max Q(s', a') otherwise
+       Q(s,a) = Q(s,a) + alpha * (target - Q(s,a))
+
+4. Learning rate (alpha)
+   Each (state, action) pair has its own visit count n.
+   alpha = max(0.01, 1 / n^0.6)
+   So new pairs learn fast, and well-visited pairs change slowly and become
+   stable. The small minimum (0.01) keeps it learning a little bit.
+
+5. Exploration (epsilon)
+   - epsilon starts at 0.5 and goes down in a straight line to 0.02 by the
+     time 80% of the training time has passed, then stays at 0.02.
+   - Early on the agent tries many actions; later it mostly uses what it
+     has learnt.
+
+6. Time limit
+   - We train episode after episode until the time limit minus a small
+     safety margin. The clock is checked every 128 steps inside an episode
+     so that we stop on time.
+
+7. Choosing an action (after training)
+   - Build the same smaller state (with mirroring).
+   - Pick the action with the highest Q-value, but only among actions that
+     were actually tried in that state during training.
+   - If the state was never seen at all, pick a safe default action that
+     does not change lanes.
+   - If the state was mirrored, swap the lane action back before returning.
+
+============================================================
+Summary
+============================================================
+Part A: factored model + fast in-place value iteration that uses all the
+given time and always keeps a valid policy.
+Part B: Q-learning on a small, symmetric state with per-pair decaying
+learning rate and decaying epsilon-greedy exploration.
